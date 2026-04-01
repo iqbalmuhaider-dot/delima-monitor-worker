@@ -1,5 +1,5 @@
-// DELIMa Monitor Worker - D1 Database
-// Handles login tracking, analytics, dashboard
+// DELIMa Monitor Worker - D1 Database + Google OAuth + Admin Role
+// Handles login tracking, analytics, dashboard, user roles
 
 export default {
   async fetch(request, env, ctx) {
@@ -10,16 +10,28 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
     
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
     }
     
-    // API: Record login
-    if (path === '/api/login' && request.method === 'POST') {
-      return handleLogin(request, env, corsHeaders);
+    // API: Google login & record
+    if (path === '/api/google-login' && request.method === 'POST') {
+      return handleGoogleLogin(request, env, corsHeaders);
+    }
+    
+    // API: Get current user
+    if (path === '/api/me' && request.method === 'GET') {
+      const email = url.searchParams.get('email');
+      return handleGetUser(email, env, corsHeaders);
+    }
+    
+    // API: Get all users (admin only)
+    if (path === '/api/users' && request.method === 'GET') {
+      const adminEmail = url.searchParams.get('admin');
+      return handleGetAllUsers(adminEmail, env, corsHeaders);
     }
     
     // API: Get student stats
@@ -44,18 +56,23 @@ export default {
       return handleTopStudents(limit, env, corsHeaders);
     }
     
+    // API: Set user role (admin only)
+    if (path === '/api/role' && request.method === 'PUT') {
+      return handleSetRole(request, env, corsHeaders);
+    }
+    
     // Default: Serve static files from Pages
     return env.ASSETS.fetch(request);
   }
 };
 
-// Handle login recording
-async function handleLogin(request, env, corsHeaders) {
+// Handle Google login & create user
+async function handleGoogleLogin(request, env, corsHeaders) {
   try {
     const data = await request.json();
-    const { studentName, studentEmail, schoolName } = data;
+    const { email, name, picture, schoolName } = data;
     
-    if (!studentEmail) {
+    if (!email) {
       return new Response(JSON.stringify({
         success: false,
         error: 'Email is required'
@@ -65,49 +82,216 @@ async function handleLogin(request, env, corsHeaders) {
       });
     }
     
-    // Check if student exists
+    // Validate DELIMa domain
+    const allowedDomains = ['student.moe-dl.edu.my', 'moe-dl.edu.my'];
+    const domain = email.split('@')[1];
+    
+    if (!allowedDomains.includes(domain)) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Only DELIMa accounts allowed (@student.moe-dl.edu.my or @moe-dl.edu.my)'
+      }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // Check if user exists
     const existing = await env.DB.prepare(
-      'SELECT * FROM delima_logins WHERE student_email = ?'
-    ).bind(studentEmail).first();
+      'SELECT * FROM users WHERE email = ?'
+    ).bind(email).first();
     
     if (existing) {
-      // Update existing record
+      // Update last login
       await env.DB.prepare(`
-        UPDATE delima_logins 
-        SET login_count = login_count + 1, 
-            last_login = datetime('now')
-        WHERE student_email = ?
-      `).bind(studentEmail).run();
+        UPDATE users 
+        SET last_login = datetime('now'),
+            login_count = login_count + 1
+        WHERE email = ?
+      `).bind(email).run();
       
       return new Response(JSON.stringify({
         success: true,
-        message: 'Login recorded',
-        loginCount: existing.login_count + 1,
-        isFirstLogin: false
+        user: {
+          id: existing.id,
+          email: existing.email,
+          name: existing.name,
+          role: existing.role,
+          isFirstLogin: false,
+          loginCount: existing.login_count + 1
+        },
+        message: 'Welcome back!'
       }), {
         status: 200,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     } else {
-      // Insert new student
+      // Check if this is the first user (make them admin)
+      const firstUser = await env.DB.prepare(
+        'SELECT COUNT(*) as count FROM users'
+      ).first();
+      
+      const role = firstUser.count === 0 ? 'admin' : 'user';
+      
+      // Insert new user
       const stmt = env.DB.prepare(`
-        INSERT INTO delima_logins (student_name, student_email, school_name, login_count, first_login, last_login)
-        VALUES (?, ?, ?, 1, datetime('now'), datetime('now'))
+        INSERT INTO users (email, name, picture, school_name, role, login_count, first_login, last_login)
+        VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
       `);
       
-      const result = await stmt.bind(studentName || '', studentEmail, schoolName || '').run();
+      const result = await stmt.bind(email, name || '', picture || '', schoolName || '', role).run();
       
       return new Response(JSON.stringify({
         success: true,
-        message: 'Login recorded',
-        loginCount: 1,
-        isFirstLogin: true,
-        id: result.meta.last_row_id
+        user: {
+          id: result.meta.last_row_id,
+          email: email,
+          name: name || '',
+          role: role,
+          isFirstLogin: true,
+          loginCount: 1
+        },
+        message: role === 'admin' ? '🎉 Welcome Admin! You are the first user.' : 'Welcome!'
       }), {
         status: 201,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
+    
+  } catch (error) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// Handle get current user
+async function handleGetUser(email, env, corsHeaders) {
+  try {
+    if (!email) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Email is required'
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    
+    const user = await env.DB.prepare(
+      'SELECT id, email, name, picture, role, login_count, first_login, last_login FROM users WHERE email = ?'
+    ).bind(email).first();
+    
+    if (!user) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'User not found'
+      }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    
+    return new Response(JSON.stringify({
+      success: true,
+      user: user
+    }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+    
+  } catch (error) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// Handle get all users (admin only)
+async function handleGetAllUsers(adminEmail, env, corsHeaders) {
+  try {
+    // Verify admin
+    if (adminEmail) {
+      const admin = await env.DB.prepare(
+        'SELECT role FROM users WHERE email = ?'
+      ).bind(adminEmail).first();
+      
+      if (!admin || admin.role !== 'admin') {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Admin access required'
+        }), {
+          status: 403,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+    
+    const users = await env.DB.prepare(
+      'SELECT id, email, name, picture, role, login_count, first_login, last_login FROM users ORDER BY created_at DESC'
+    ).all();
+    
+    return new Response(JSON.stringify({
+      success: true,
+      count: users.results.length,
+      users: users.results
+    }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+    
+  } catch (error) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// Handle set user role (admin only)
+async function handleSetRole(request, env, corsHeaders) {
+  try {
+    const data = await request.json();
+    const { targetEmail, newRole, adminEmail } = data;
+    
+    // Verify admin
+    const admin = await env.DB.prepare(
+      'SELECT role FROM users WHERE email = ?'
+    ).bind(adminEmail).first();
+    
+    if (!admin || admin.role !== 'admin') {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Admin access required'
+      }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // Update role
+    await env.DB.prepare(`
+      UPDATE users SET role = ?, updated_at = datetime('now') WHERE email = ?
+    `).bind(newRole, targetEmail).run();
+    
+    return new Response(JSON.stringify({
+      success: true,
+      message: `User role updated to ${newRole}`
+    }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
     
   } catch (error) {
     return new Response(JSON.stringify({

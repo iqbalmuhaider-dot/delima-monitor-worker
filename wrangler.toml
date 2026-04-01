@@ -1,0 +1,13 @@
+name = "delima-monitor"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "kehadiran-pibg"
+database_id = "9019abcd-a7b0-4022-b9ee-08ca7573a380"
+
+# Environment variables
+[vars]
+ENVIRONMENT = "production"
